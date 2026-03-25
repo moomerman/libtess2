@@ -1,0 +1,166 @@
+name: Build libs
+
+on:
+  workflow_dispatch:
+
+jobs:
+  vendor-source:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Clone upstream libtess2
+        run: git clone --depth 1 https://github.com/memononen/libtess2.git /tmp/libtess2-upstream
+
+      - name: Vendor source and license
+        run: |
+          rm -rf src
+          mkdir -p src
+          cp /tmp/libtess2-upstream/Source/*.c /tmp/libtess2-upstream/Source/*.h src/
+          cp /tmp/libtess2-upstream/Include/tesselator.h src/
+          cp /tmp/libtess2-upstream/LICENSE.txt src/LICENSE.txt
+
+      - name: Commit vendored source
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add src/
+          if git diff --cached --quiet; then
+            echo "No changes to vendor"
+          else
+            git commit -m "Vendor latest libtess2 source"
+            git push
+          fi
+
+  build-native:
+    needs: [vendor-source]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest
+            target: darwin_arm64
+            artifact: libtess2.a
+            lib_name: libtess2_darwin_arm64.a
+            cc_flags: "-c -O2 -arch arm64"
+          - os: macos-latest
+            target: darwin_amd64
+            artifact: libtess2.a
+            lib_name: libtess2_darwin_amd64.a
+            cc_flags: "-c -O2 -arch x86_64"
+          - os: ubuntu-latest
+            target: linux_amd64
+            artifact: libtess2.a
+            lib_name: libtess2_linux_amd64.a
+            cc_flags: "-c -O2 -fPIC"
+          - os: windows-latest
+            target: windows_amd64
+            artifact: libtess2.lib
+            lib_name: libtess2_windows_amd64.lib
+
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref }}
+
+      - name: Pull latest (includes vendored source)
+        run: git pull --ff-only
+
+      - name: Build (Unix)
+        if: runner.os != 'Windows'
+        run: |
+          cd src
+          cc ${{ matrix.cc_flags }} *.c
+          ar rcs libtess2.a *.o
+
+      - name: Build (Windows)
+        if: runner.os == 'Windows'
+        shell: cmd
+        run: |
+          call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvars64.bat"
+          cd /d %GITHUB_WORKSPACE%\src
+          cl /c /O2 bucketalloc.c dict.c geom.c mesh.c priorityq.c sweep.c tess.c
+          lib /OUT:libtess2.lib *.obj
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.lib_name }}
+          path: src/${{ matrix.artifact }}
+
+  build-wasm:
+    needs: [vendor-source]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref }}
+
+      - name: Pull latest (includes vendored source)
+        run: git pull --ff-only
+
+      - name: Install dependencies
+        run: sudo apt-get update && sudo apt-get install -y llvm lld
+
+      - uses: laytan/setup-odin@v2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          release: nightly
+
+      - name: Build WASM object
+        run: |
+          ODIN_ROOT=$(odin root)
+          cd src
+          clang -c -Os --target=wasm32 \
+            --sysroot=$ODIN_ROOT/vendor/libc-shim \
+            -isystem $GITHUB_WORKSPACE/lib/wasm_shim \
+            *.c \
+            $GITHUB_WORKSPACE/lib/wasm_shim/setjmp.c
+          wasm-ld -r *.o -o libtess2_wasm.o
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: libtess2_wasm.o
+          path: src/libtess2_wasm.o
+
+  commit-libs:
+    needs: [build-native, build-wasm]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref }}
+
+      - name: Pull latest (includes vendored source)
+        run: git pull --ff-only
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Copy libs into repo
+        run: |
+          cp artifacts/libtess2_darwin_arm64.a/libtess2.a       lib/libtess2_darwin_arm64.a
+          cp artifacts/libtess2_darwin_amd64.a/libtess2.a       lib/libtess2_darwin_amd64.a
+          cp artifacts/libtess2_linux_amd64.a/libtess2.a        lib/libtess2_linux_amd64.a
+          cp artifacts/libtess2_windows_amd64.lib/libtess2.lib  lib/libtess2_windows_amd64.lib
+          cp artifacts/libtess2_wasm.o/libtess2_wasm.o          lib/libtess2_wasm.o
+
+      - name: Commit and push
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add lib/
+          if git diff --cached --quiet; then
+            echo "No changes to commit"
+          else
+            git commit -m "Update pre-built libtess2 libraries"
+            git push
+          fi
