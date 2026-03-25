@@ -32,7 +32,7 @@
 #ifndef DICT_LIST_H
 #define DICT_LIST_H
 
-#include "../Include/tesselator.h"
+#include "tesselator.h"
 #include "mesh.h"
 
 typedef struct Dict Dict;
